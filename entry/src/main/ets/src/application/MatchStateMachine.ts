@@ -8,9 +8,16 @@ import {
   Server,
   SpecialPointMode
 } from '../domain/MatchState';
-import { MatchEvent } from './MatchEvents';
 
 const DEFAULT_SCHEMA_VERSION = 1;
+
+type MatchStateMachineEvent =
+  | { type: 'START_MATCH' }
+  | { type: 'PAUSE_MATCH' }
+  | { type: 'RESUME_MATCH' }
+  | { type: 'FINISH_MATCH' }
+  | { type: 'TICK'; seconds: number }
+  | { type: string; [key: string]: string | number | boolean };
 
 export class MatchStateMachine {
   createInitialState(matchId: string, config?: Partial<MatchConfig>, nowIso: string = new Date().toISOString()): MatchState {
@@ -47,12 +54,12 @@ export class MatchStateMachine {
     };
   }
 
-  reduce(currentState: MatchState, event: MatchEvent, nowIso: string = new Date().toISOString()): MatchState {
+  reduce(currentState: MatchState, event: MatchStateMachineEvent, nowIso: string = new Date().toISOString()): MatchState {
     const nextState = this.reduceCore(currentState, event, nowIso);
     return this.appendEvent(nextState, event, nowIso);
   }
 
-  private reduceCore(currentState: MatchState, event: MatchEvent, nowIso: string): MatchState {
+  private reduceCore(currentState: MatchState, event: MatchStateMachineEvent, nowIso: string): MatchState {
     switch (event.type) {
       case 'START_MATCH':
         return {
@@ -102,7 +109,7 @@ export class MatchStateMachine {
           metadata: {
             ...currentState.metadata,
             updatedAt: nowIso,
-            elapsedSeconds: currentState.metadata.elapsedSeconds + event.seconds
+            elapsedSeconds: currentState.metadata.elapsedSeconds + Number(event.seconds)
           }
         };
       default:
@@ -110,7 +117,7 @@ export class MatchStateMachine {
     }
   }
 
-  private appendEvent(currentState: MatchState, event: MatchEvent, nowIso: string): MatchState {
+  private appendEvent(currentState: MatchState, event: MatchStateMachineEvent, nowIso: string): MatchState {
     const payload: MatchEventPayload = { ...event };
     const timelineEvent = Object.freeze({
       eventId: `${currentState.metadata.matchId}:${currentState.eventHistory.length + 1}`,
