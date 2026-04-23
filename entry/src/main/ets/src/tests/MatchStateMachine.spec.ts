@@ -1,5 +1,5 @@
-import { MatchStateMachine } from '../application/MatchStateMachine';
-import { MatchStatus } from '../domain/MatchState';
+import { PadelScoringEngine } from '../application/PadelScoringEngine';
+import { GameSubState, MatchLifecycleStatus, ScoringMode } from '../domain/PadelScoring';
 
 const machine = new MatchStateMachine();
 const initial = machine.createInitialState('match-test-1', undefined, '2026-04-23T10:00:00.000Z');
@@ -17,6 +17,10 @@ const ticked = machine.reduce(started, { type: 'TICK', seconds: 5 }, '2026-04-23
 if (ticked.metadata.elapsedSeconds !== 5) {
   throw new Error('TICK should increase elapsedSeconds');
 }
+snap = golden.getSnapshot();
+assert(snap.gameSubState === GameSubState.GOLDEN_POINT, 'GOLDEN_POINT debe mostrar punto decisivo en deuce');
+snap = golden.dispatch({ type: 'PointWonByA' });
+assert(snap.gamesInSetA === 1, 'GOLDEN_POINT debe cerrar el game con un único punto tras deuce');
 
 const paused = machine.reduce(ticked, { type: 'PAUSE_MATCH' }, '2026-04-23T10:00:12.000Z');
 if (paused.status !== MatchStatus.PAUSED) {
