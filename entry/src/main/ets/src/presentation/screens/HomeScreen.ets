@@ -1,3 +1,4 @@
+import common from '@ohos.app.ability.common';
 import {
   GameSubState,
   MatchLifecycleStatus,
@@ -7,31 +8,42 @@ import {
 import { MatchEvent } from '../../application/MatchEvents';
 import { PadelScoringEngine } from '../../application/PadelScoringEngine';
 import { PrimaryActionButton } from '../components/PrimaryActionButton';
+import { HarmonyPreferencesKVStore } from '../../infrastructure/persistence/HarmonyPreferencesKVStore';
+import { LocalMatchRepository, PersistedMatchSession } from '../../infrastructure/persistence/LocalMatchRepository';
 
 @Component
 export struct HomeScreen {
   private readonly defaultScoringMode: ScoringMode = ScoringMode.CLASSIC;
   private readonly defaultBestOf: 1 | 3 | 5 = 3;
+  private readonly persistDebounceMs: number = 500;
 
   private engine: PadelScoringEngine = new PadelScoringEngine({
     scoringMode: this.defaultScoringMode,
     bestOf: this.defaultBestOf
   });
+  private repository?: LocalMatchRepository;
   private tickerId: number = -1;
+  private persistTimerId: number = -1;
   private matchStartedAtMs: number = 0;
   private pauseStartedAtMs: number = 0;
   private pausedMs: number = 0;
+  private eventHistory: MatchEvent[] = [];
+  private restoredFromStorage: boolean = false;
 
   @State private snapshot: MatchSnapshot = this.engine.getSnapshot();
   @State private pointFeedback: string = '';
 
   aboutToAppear() {
     this.startTicker();
-    this.startMatch();
+    if (!this.restoredFromStorage) {
+      this.restoredFromStorage = true;
+      void this.restoreLastMatchOrStartNew();
+    }
   }
 
   aboutToDisappear() {
     this.stopTicker();
+    void this.flushPersistence();
   }
 
   private startTicker() {
@@ -55,17 +67,20 @@ export struct HomeScreen {
     this.pausedMs = 0;
     this.matchStartedAtMs = Date.now();
     this.pauseStartedAtMs = 0;
+    this.eventHistory = [];
     this.dispatch({
       type: 'StartMatch',
       config: {
         bestOf: this.defaultBestOf,
         scoringMode: this.defaultScoringMode
       }
-    });
+    }, true);
   }
 
-  private dispatch(event: MatchEvent) {
+  private dispatch(event: MatchEvent, persistImmediately: boolean = false) {
     this.snapshot = this.engine.dispatch(event);
+    this.eventHistory = [...this.eventHistory, event];
+    this.schedulePersistence(persistImmediately);
   }
 
   private awardPoint(team: 'A' | 'B') {
@@ -85,7 +100,7 @@ export struct HomeScreen {
   private togglePauseOrResume() {
     if (this.snapshot.status === MatchLifecycleStatus.IN_PROGRESS) {
       this.pauseStartedAtMs = Date.now();
-      this.dispatch({ type: 'Pause' });
+      this.dispatch({ type: 'Pause' }, true);
       return;
     }
 
@@ -94,7 +109,7 @@ export struct HomeScreen {
         this.pausedMs += Date.now() - this.pauseStartedAtMs;
         this.pauseStartedAtMs = 0;
       }
-      this.dispatch({ type: 'Resume' });
+      this.dispatch({ type: 'Resume' }, true);
     }
   }
 
@@ -177,6 +192,107 @@ export struct HomeScreen {
     if (typeof vibrateFn === 'function') {
       vibrateFn(20);
     }
+  }
+
+  private getRepository(): LocalMatchRepository {
+    if (!this.repository) {
+      const context = getContext(this) as common.UIAbilityContext;
+      this.repository = new LocalMatchRepository(new HarmonyPreferencesKVStore(context));
+    }
+
+    return this.repository;
+  }
+
+  private async restoreLastMatchOrStartNew(): Promise<void> {
+    try {
+      const persisted = await this.getRepository().readActiveMatch();
+      if (!persisted || persisted.matchState.status === MatchLifecycleStatus.NOT_STARTED) {
+        this.startMatch();
+        return;
+      }
+
+      this.eventHistory = [...persisted.eventHistory];
+      this.matchStartedAtMs = persisted.matchStartedAtMs;
+      this.pauseStartedAtMs = persisted.pauseStartedAtMs;
+      this.pausedMs = persisted.pausedMs;
+
+      const restoredState = persisted.matchState;
+      this.engine = new PadelScoringEngine({
+        bestOf: restoredState.bestOf,
+        scoringMode: restoredState.scoringMode
+      });
+
+      this.engine.dispatch({
+        type: 'StartMatch',
+        config: {
+          bestOf: restoredState.bestOf,
+          scoringMode: restoredState.scoringMode
+        }
+      });
+
+      this.engine.dispatch({
+        type: 'EditScore',
+        patch: {
+          setsWonA: restoredState.setsWonA,
+          setsWonB: restoredState.setsWonB,
+          gamesInSetA: restoredState.gamesInSetA,
+          gamesInSetB: restoredState.gamesInSetB,
+          pointsA: restoredState.pointsA,
+          pointsB: restoredState.pointsB,
+          status: MatchLifecycleStatus.IN_PROGRESS,
+          winner: restoredState.winner,
+          advantagesUsedInCurrentGame: restoredState.advantagesUsedInCurrentGame
+        }
+      });
+
+      if (restoredState.status === MatchLifecycleStatus.PAUSED) {
+        this.engine.dispatch({ type: 'Pause' });
+      }
+
+      this.snapshot = this.engine.getSnapshot();
+    } catch (_error) {
+      this.startMatch();
+    }
+  }
+
+  private buildPersistedSession(): PersistedMatchSession {
+    return {
+      matchState: this.snapshot,
+      eventHistory: this.eventHistory,
+      matchStartedAtMs: this.matchStartedAtMs,
+      pauseStartedAtMs: this.pauseStartedAtMs,
+      pausedMs: this.pausedMs,
+      persistedAtMs: Date.now()
+    };
+  }
+
+  private schedulePersistence(forceNow: boolean = false) {
+    if (this.persistTimerId >= 0) {
+      clearTimeout(this.persistTimerId);
+      this.persistTimerId = -1;
+    }
+
+    if (forceNow) {
+      void this.persistNow();
+      return;
+    }
+
+    this.persistTimerId = setTimeout(() => {
+      this.persistTimerId = -1;
+      void this.persistNow();
+    }, this.persistDebounceMs);
+  }
+
+  private async persistNow(): Promise<void> {
+    await this.getRepository().saveActiveMatch(this.buildPersistedSession());
+  }
+
+  private async flushPersistence(): Promise<void> {
+    if (this.persistTimerId >= 0) {
+      clearTimeout(this.persistTimerId);
+      this.persistTimerId = -1;
+    }
+    await this.persistNow();
   }
 
   @Builder
